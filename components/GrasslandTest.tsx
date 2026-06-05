@@ -6,6 +6,7 @@ import {
   answerOptions,
   dimensions,
   getQuestionsForMode,
+  personalityTypes,
   testModes,
   type AnswerValue,
   type DimensionId,
@@ -17,6 +18,13 @@ import {
   getDimensionPositionLabel,
   type AnswerMap
 } from "@/lib/scoring";
+import {
+  buildShareCardFilename,
+  buildShareCardSvg,
+  getClosestPersonalityMatches,
+  getDimensionInsight,
+  type DimensionInsight
+} from "@/lib/result-enhancements";
 import { buildModeHelperLine } from "@/lib/test-mode-copy";
 import {
   buildShareText,
@@ -24,6 +32,21 @@ import {
   getDimensionNeedleRotation,
   getPersonalityVisualProfile
 } from "@/lib/result-presentation";
+import {
+  getDailyGrasslandWeather,
+  getPersonalityAtlasEntries,
+  getRelationshipReport
+} from "@/lib/social-growth";
+import {
+  addArchivedResult,
+  clearArchiveStorage,
+  createArchivedResult,
+  getArchiveDelta,
+  readArchive,
+  writeArchive,
+  type ArchiveDelta,
+  type ArchivedResult
+} from "@/lib/result-archive";
 
 type Phase = "home" | "test" | "result";
 
@@ -37,12 +60,28 @@ const completionMessages = [
   "马上抵达你的草原意象"
 ];
 
+function loadInitialArchive(): ArchivedResult[] {
+  if (typeof window === "undefined") {
+    return [];
+  }
+
+  try {
+    return readArchive(window.localStorage);
+  } catch {
+    return [];
+  }
+}
+
 export function GrasslandTest() {
   const [phase, setPhase] = useState<Phase>("home");
   const [selectedModeId, setSelectedModeId] = useState<TestModeId>("professional");
   const [currentIndex, setCurrentIndex] = useState(0);
   const [answers, setAnswers] = useState<AnswerMap>({});
   const [copied, setCopied] = useState(false);
+  const [imageStatus, setImageStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [selectedPartnerId, setSelectedPartnerId] = useState("");
+  const [archiveEntries, setArchiveEntries] = useState<ArchivedResult[]>(loadInitialArchive);
+  const [archiveStatus, setArchiveStatus] = useState<"idle" | "saved" | "cleared" | "error">("idle");
 
   const activeMode = testModes.find((mode) => mode.id === selectedModeId) ?? testModes[0]!;
   const activeQuestions = useMemo(() => getQuestionsForMode(selectedModeId), [selectedModeId]);
@@ -56,12 +95,53 @@ export function GrasslandTest() {
   const canSeeResult = answeredCount === activeQuestions.length;
   const shareText = useMemo(() => buildShareText(match), [match]);
   const modeHelperLine = useMemo(() => buildModeHelperLine(activeMode), [activeMode]);
+  const modeLabel = `${activeMode.name} · ${activeMode.badge}`;
+  const closestMatches = useMemo(() => getClosestPersonalityMatches(scores.normalized, 3), [scores.normalized]);
+  const selectedPartner = useMemo(
+    () =>
+      personalityTypes.find((personality) => personality.id === selectedPartnerId) ??
+      personalityTypes.find((personality) => personality.id !== match.id) ??
+      personalityTypes[0]!,
+    [match.id, selectedPartnerId]
+  );
+  const relationshipReport = useMemo(
+    () => getRelationshipReport(match, selectedPartner),
+    [match, selectedPartner]
+  );
+  const dailyWeather = useMemo(() => getDailyGrasslandWeather(match), [match]);
+  const atlasEntries = useMemo(() => getPersonalityAtlasEntries(match.id), [match.id]);
+  const dimensionInsights = useMemo(
+    () =>
+      dimensionOrder.reduce(
+        (collection, dimensionId) => ({
+          ...collection,
+          [dimensionId]: getDimensionInsight(dimensionId, scores.normalized[dimensionId])
+        }),
+        {} as Record<DimensionId, DimensionInsight>
+      ),
+    [scores.normalized]
+  );
+  const shareCardSvg = useMemo(
+    () =>
+      buildShareCardSvg({
+        personality: match,
+        visualProfile,
+        scores: scores.normalized,
+        modeLabel,
+        dimensions
+      }),
+    [match, modeLabel, scores.normalized, visualProfile]
+  );
+  const shareCardFilename = useMemo(() => buildShareCardFilename(match.name), [match.name]);
 
   function selectMode(modeId: TestModeId) {
     setSelectedModeId(modeId);
     setAnswers({});
     setCurrentIndex(0);
     setCopied(false);
+    setImageStatus("idle");
+    setSelectedPartnerId("");
+    setArchiveStatus("idle");
   }
 
   function startTest() {
@@ -69,6 +149,9 @@ export function GrasslandTest() {
     setPhase("test");
     setCurrentIndex(0);
     setCopied(false);
+    setImageStatus("idle");
+    setSelectedPartnerId("");
+    setArchiveStatus("idle");
   }
 
   function selectAnswer(value: AnswerValue) {
@@ -81,6 +164,8 @@ export function GrasslandTest() {
       [currentQuestion.id]: value
     }));
     setCopied(false);
+    setImageStatus("idle");
+    setArchiveStatus("idle");
   }
 
   function goNext() {
@@ -104,6 +189,9 @@ export function GrasslandTest() {
     setAnswers({});
     setCurrentIndex(0);
     setCopied(false);
+    setImageStatus("idle");
+    setSelectedPartnerId("");
+    setArchiveStatus("idle");
     setPhase("home");
   }
 
@@ -113,6 +201,52 @@ export function GrasslandTest() {
       setCopied(true);
     } catch {
       setCopied(false);
+    }
+  }
+
+  async function downloadShareCardImage() {
+    setImageStatus("saving");
+
+    const svgBlob = new Blob([shareCardSvg], { type: "image/svg+xml;charset=utf-8" });
+    const svgUrl = URL.createObjectURL(svgBlob);
+
+    try {
+      const pngBlob = await renderSvgToPng(svgUrl);
+      downloadBlob(pngBlob, shareCardFilename);
+      setImageStatus("saved");
+    } catch {
+      downloadBlob(svgBlob, shareCardFilename.replace(/\.png$/, ".svg"));
+      setImageStatus("error");
+    } finally {
+      URL.revokeObjectURL(svgUrl);
+    }
+  }
+
+  function saveCurrentResultToArchive() {
+    try {
+      const entry = createArchivedResult({
+        personality: match,
+        mode: activeMode,
+        answeredCount,
+        scores: scores.normalized
+      });
+      const nextArchive = addArchivedResult(archiveEntries, entry);
+
+      writeArchive(window.localStorage, nextArchive);
+      setArchiveEntries(nextArchive);
+      setArchiveStatus("saved");
+    } catch {
+      setArchiveStatus("error");
+    }
+  }
+
+  function clearGrasslandArchive() {
+    try {
+      clearArchiveStorage(window.localStorage);
+      setArchiveEntries([]);
+      setArchiveStatus("cleared");
+    } catch {
+      setArchiveStatus("error");
     }
   }
 
@@ -293,7 +427,7 @@ export function GrasslandTest() {
               <div className={`personality-card ${visualProfile.toneClass}`}>
                 <div className="personality-card-top">
                   <p className="eyebrow">你的草原意象是</p>
-                  <span className="mode-pill">{activeMode.name} · {activeMode.badge}</span>
+                  <span className="mode-pill">{modeLabel}</span>
                   <div className="result-stamp" aria-hidden="true">
                     {visualProfile.stampText}
                   </div>
@@ -341,6 +475,172 @@ export function GrasslandTest() {
               <ResultBlock title="相处建议" body={match.relationshipTip} />
             </div>
 
+            <div className="growth-grid">
+              <article className="daily-weather-card">
+                <div className="growth-card-head">
+                  <div>
+                    <p className="eyebrow accent">每日草原天气</p>
+                    <h3>{dailyWeather.title}</h3>
+                  </div>
+                  <span>{dailyWeather.seedDate}</span>
+                </div>
+                <p>{dailyWeather.forecast}</p>
+                <strong>{dailyWeather.action}</strong>
+              </article>
+
+              <article className="relationship-card">
+                <div className="growth-card-head">
+                  <div>
+                    <p className="eyebrow accent">双人相处报告</p>
+                    <h3>{relationshipReport.climate}</h3>
+                  </div>
+                  <strong>距离 {relationshipReport.distance}</strong>
+                </div>
+
+                <label className="partner-select-label" htmlFor="partner-type">
+                  对方草原意象
+                </label>
+                <select
+                  id="partner-type"
+                  className="partner-select"
+                  value={selectedPartner.id}
+                  onChange={(event) => setSelectedPartnerId(event.target.value)}
+                >
+                  {personalityTypes.map((personality) => (
+                    <option key={personality.id} value={personality.id}>
+                      {personality.name}
+                      {personality.id === match.id ? "（当前结果）" : ""}
+                    </option>
+                  ))}
+                </select>
+
+                <p className="relationship-summary">{relationshipReport.summary}</p>
+                <div className="report-metrics">
+                  <div>
+                    <span>同频点</span>
+                    <p>{relationshipReport.shared}</p>
+                  </div>
+                  <div>
+                    <span>易卡点</span>
+                    <p>{relationshipReport.watchOut}</p>
+                  </div>
+                  <div>
+                    <span>相处动作</span>
+                    <p>{relationshipReport.suggestion}</p>
+                  </div>
+                </div>
+              </article>
+            </div>
+
+            <details className="atlas-panel">
+              <summary>
+                <span>
+                  <em className="eyebrow accent">草原图鉴</em>
+                  <strong>20 种原创意象</strong>
+                </span>
+                <small aria-hidden="true" />
+              </summary>
+              <div className="atlas-grid">
+                {atlasEntries.map((entry) => (
+                  <article key={entry.id} className={`atlas-card ${entry.toneClass}`} data-current={entry.isCurrent}>
+                    <div className="atlas-card-head">
+                      <h4>{entry.name}</h4>
+                      {entry.isCurrent && <span>当前结果</span>}
+                    </div>
+                    <p>{entry.motifLabel}</p>
+                    <div className="atlas-keywords">
+                      {entry.keywords.slice(0, 3).map((keyword) => (
+                        <span key={keyword}>{keyword}</span>
+                      ))}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </details>
+
+            <div className="archive-panel">
+              <div className="archive-panel-head">
+                <div>
+                  <p className="eyebrow accent">我的草原档案</p>
+                  <h3>把这次风向存进本机</h3>
+                  <p>档案只保存在当前浏览器，用来回看最近几次测试和五维变化。</p>
+                </div>
+                <div className="archive-actions">
+                  <button
+                    type="button"
+                    className="meadow-button compact-action"
+                    disabled={archiveStatus === "saved"}
+                    onClick={saveCurrentResultToArchive}
+                  >
+                    {archiveStatus === "saved" ? "已保存" : "保存到草原档案"}
+                  </button>
+                  <button
+                    type="button"
+                    className="quiet-button compact-action"
+                    disabled={archiveEntries.length === 0}
+                    onClick={clearGrasslandArchive}
+                  >
+                    清空档案
+                  </button>
+                </div>
+              </div>
+
+              <p className="archive-status" aria-live="polite">
+                {archiveStatus === "saved" && "已保存到本机草原档案。"}
+                {archiveStatus === "cleared" && "本机草原档案已清空。"}
+                {archiveStatus === "error" && "本机存储暂时不可用，结果仍可复制或保存图片。"}
+              </p>
+
+              {archiveEntries.length === 0 ? (
+                <div className="archive-empty">
+                  <strong>还没有保存过的草原风向</strong>
+                  <p>保存后，你会在这里看到最近结果、人格变化和五维分数起伏。</p>
+                </div>
+              ) : (
+                <div className="archive-list">
+                  {archiveEntries.map((entry, index) => (
+                    <ArchiveCard
+                      key={entry.id}
+                      entry={entry}
+                      previousEntry={archiveEntries[index + 1]}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="similar-panel">
+              <div className="similar-panel-head">
+                <div>
+                  <p className="eyebrow accent">相近草原意象</p>
+                  <h3>你附近还亮着这些轮廓</h3>
+                </div>
+                <p>距离越小，说明五维风向越接近。</p>
+              </div>
+
+              <div className="similar-grid">
+                {closestMatches.map((personality, index) => {
+                  const profile = getPersonalityVisualProfile(personality.id);
+
+                  return (
+                    <article key={personality.id} className="similar-card">
+                      <span className="similar-rank">#{index + 1}</span>
+                      <div>
+                        <h4>{personality.name}</h4>
+                        <p>{profile.motifLabel}</p>
+                      </div>
+                      <strong>距离 {personality.distance}</strong>
+                      <div className="similar-keywords">
+                        {personality.keywords.slice(0, 3).map((keyword) => (
+                          <span key={keyword}>{keyword}</span>
+                        ))}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </div>
+
             <div className="score-panel">
               <div className="score-panel-head">
                 <div>
@@ -355,6 +655,7 @@ export function GrasslandTest() {
                   const dimension = dimensions.find((item) => item.id === dimensionId);
                   const value = scores.normalized[dimensionId];
                   const markerPosition = getDimensionMarkerPosition(value);
+                  const insight = dimensionInsights[dimensionId];
 
                   if (!dimension) {
                     return null;
@@ -378,6 +679,11 @@ export function GrasslandTest() {
                         <span>{dimension.negativeLabel}</span>
                         <span>{dimension.positiveLabel}</span>
                       </div>
+                      <details className="dimension-insight">
+                        <summary>怎么看这个分数</summary>
+                        <p>{insight.description}</p>
+                        <span>{insight.suggestion}</span>
+                      </details>
                     </div>
                   );
                 })}
@@ -388,17 +694,31 @@ export function GrasslandTest() {
               <div className="share-panel-head">
                 <div>
                   <p className="eyebrow">可复制分享文案</p>
-                  <p>分享给朋友时，记得说这只是娱乐自测。</p>
+                  <p>也可以保存一张结果图，分享给朋友时记得说这只是娱乐自测。</p>
                 </div>
-                <button
-                  type="button"
-                  className="quiet-button compact-action"
-                  onClick={copyShareText}
-                  aria-live="polite"
-                >
-                  {copied ? "已复制" : "复制文案"}
-                </button>
+                <div className="share-action-row">
+                  <button
+                    type="button"
+                    className="meadow-button compact-action"
+                    disabled={imageStatus === "saving"}
+                    onClick={downloadShareCardImage}
+                  >
+                    {imageStatus === "saving" ? "生成中" : "保存结果图"}
+                  </button>
+                  <button
+                    type="button"
+                    className="quiet-button compact-action"
+                    onClick={copyShareText}
+                    aria-live="polite"
+                  >
+                    {copied ? "已复制" : "复制文案"}
+                  </button>
+                </div>
               </div>
+              <p className="download-status" aria-live="polite">
+                {imageStatus === "saved" && "结果图已开始下载。"}
+                {imageStatus === "error" && "PNG 生成受阻，已改为保存 SVG 图片。"}
+              </p>
               <textarea
                 className="share-textarea"
                 readOnly
@@ -432,4 +752,164 @@ function ResultBlock({ title, body }: { title: string; body: string }) {
       <p>{body}</p>
     </article>
   );
+}
+
+function ArchiveCard({
+  entry,
+  previousEntry
+}: {
+  entry: ArchivedResult;
+  previousEntry?: ArchivedResult;
+}) {
+  const delta = getArchiveDelta(entry, previousEntry);
+  const strongestDelta = delta ? getStrongestArchiveDelta(delta) : null;
+
+  return (
+    <article className="archive-card">
+      <div className="archive-card-head">
+        <div>
+          <h4>{entry.personalityName}</h4>
+          <p>
+            <time dateTime={entry.finishedAt}>{formatArchiveDate(entry.finishedAt)}</time>
+            <span>{entry.modeName} · {entry.modeBadge}</span>
+          </p>
+        </div>
+        <strong>{entry.answeredCount} 题</strong>
+      </div>
+
+      <div className="archive-keywords">
+        {entry.keywords.slice(0, 3).map((keyword) => (
+          <span key={keyword}>{keyword}</span>
+        ))}
+      </div>
+
+      <div className="archive-score-grid">
+        {dimensionOrder.map((dimensionId) => (
+          <span key={dimensionId} className="archive-score-chip">
+            <b>{dimensionId}</b>
+            <strong>{formatSignedValue(entry.scores[dimensionId])}</strong>
+            {delta && (
+              <small data-direction={getDeltaDirection(delta.dimensionDeltas[dimensionId])}>
+                {formatDeltaValue(delta.dimensionDeltas[dimensionId])}
+              </small>
+            )}
+          </span>
+        ))}
+      </div>
+
+      {delta && strongestDelta ? (
+        <p className="archive-delta">
+          与上次相比：
+          {delta.personalityChanged
+            ? `从「${delta.previousPersonalityName}」来到「${entry.personalityName}」`
+            : "人格意象保持稳定"}
+          ，变化最明显的是「{strongestDelta.name}」{formatDeltaValue(strongestDelta.value)}。
+        </p>
+      ) : (
+        <p className="archive-delta muted">这是本机草原档案里的第一条记录。</p>
+      )}
+    </article>
+  );
+}
+
+function getStrongestArchiveDelta(delta: ArchiveDelta): { name: string; value: number } | null {
+  const strongest = dimensionOrder
+    .map((dimensionId) => ({
+      dimensionId,
+      value: delta.dimensionDeltas[dimensionId]
+    }))
+    .sort((a, b) => Math.abs(b.value) - Math.abs(a.value))[0];
+
+  if (!strongest) {
+    return null;
+  }
+
+  const dimension = dimensions.find((item) => item.id === strongest.dimensionId);
+
+  return {
+    name: dimension?.name ?? strongest.dimensionId,
+    value: strongest.value
+  };
+}
+
+function formatArchiveDate(value: string): string {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "时间未知";
+  }
+
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(date);
+}
+
+function formatSignedValue(value: number): string {
+  return value > 0 ? `+${value}` : `${value}`;
+}
+
+function formatDeltaValue(value: number): string {
+  if (value === 0) {
+    return "0";
+  }
+
+  return value > 0 ? `+${value}` : `${value}`;
+}
+
+function getDeltaDirection(value: number): "up" | "down" | "flat" {
+  if (value > 0) {
+    return "up";
+  }
+
+  if (value < 0) {
+    return "down";
+  }
+
+  return "flat";
+}
+
+function renderSvgToPng(svgUrl: string): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+
+    image.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1080;
+      canvas.height = 1440;
+
+      const context = canvas.getContext("2d");
+      if (!context) {
+        reject(new Error("Canvas is unavailable."));
+        return;
+      }
+
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => {
+        if (blob) {
+          resolve(blob);
+          return;
+        }
+
+        reject(new Error("PNG generation failed."));
+      }, "image/png");
+    };
+
+    image.onerror = () => reject(new Error("Share card image failed to load."));
+    image.src = svgUrl;
+  });
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
